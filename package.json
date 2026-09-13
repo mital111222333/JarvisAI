@@ -1,0 +1,6 @@
+{
+  "name": "jarvis-backend-vercel",
+  "version": "1.0.0",
+  "description": "Serverless backend proxy for JARVIS on Vercel — прячет Gemini API ключ",
+  "type": "module"
+}
