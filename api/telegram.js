@@ -5,6 +5,8 @@
 import * as XLSX from "xlsx";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image-preview";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -17,11 +19,27 @@ const BASE_SYSTEM_PROMPT = `Ты — Джарвис, личный ИИ-асси�
 Отвечай на том же языке, на котором пишет пользователь — если он пишет на узбекском, отвечай на узбекском; если на русском — на русском.
 Ответы держи короткими и разговорными — это переписка в Telegram, а не документ.
 Ты умеешь анализировать присланные фото, голосовые, видео, PDF и Excel/CSV файлы, читать ссылки и искать актуальную информацию в интернете — отвечай по существу.
+Если на присланном ФОТО есть таблица с числами и нужно что-то посчитать (сумма, план/факт и т.п.) — сначала перечисли построчно все значения, которые ты видишь на фото (кратко, в столбик), и только потом дай итоговый расчёт. Это нужно, чтобы пользователь мог сразу проверить, правильно ли ты прочитал цифры с изображения — распознавание текста на фото не идеально, особенно на длинных таблицах. Если фото нечёткое или строк много и есть риск ошибиться — прямо скажи об этом и предложи прислать файл (.xlsx/.csv) вместо фото для точного счёта.
 Это ранний прототип: часть функций (календарь, задачи, аналитика MITAL) ещё не подключены — если пользователь просит то, чего ты пока не умеешь, честно скажи об этом коротко и дружелюбно.
 
 Если пользователь просит сгенерировать или отредактировать изображение — напиши короткий обычный ответ, и в конце на отдельной строке добавь: [[IMAGE_PROMPT: подробное описание нужного изображения на английском]]. Если он прислал фото и просит его отредактировать — опиши в промпте, что изменить.
 
-Если пользователь просит создать таблицу/отчёт/экспорт в Excel — напиши короткий обычный ответ, и в конце на отдельной строке добавь: [[EXCEL_TABLE: {"sheetName":"Лист1","headers":["Колонка1","Колонка2"],"rows":[["значение1","значение2"]]}]] — валидный JSON в одну строку.`;
+Если пользователь просит создать таблицу/отчёт/экспорт в Excel — напиши короткий обычный ответ, и в конце на отдельной строке добавь: [[EXCEL_TABLE: {"sheetName":"Лист1","headers":["Колонка1","Колонка2"],"rows":[["значение1","значение2"]]}]] — валидный JSON в одну строку.
+
+Если пользователь спрашивает про расписание/календарь/что у него запланировано — напиши короткий ответ и добавь на отдельной строке: [[CALENDAR_LIST]]
+Если пользователь просит создать событие/встречу/напоминание в календаре — напиши короткий ответ и добавь на отдельной строке: [[CALENDAR_CREATE: {"title":"Название","start":"2026-09-20T14:00:00+05:00","end":"2026-09-20T15:00:00+05:00","description":""}]] — время в формате ISO с часовым поясом Узбекистана (+05:00), обязательно валидный JSON в одну строку. Сегодняшняя дата и время будут даны тебе в контексте, ориентируйся по ним.
+
+Если пользователь просит напомнить о чём-то — напиши короткий ответ-подтверждение и добавь на отдельной строке метку. Три варианта:
+- Разовое напоминание: [[REMINDER_CREATE: {"message":"текст","remind_at":"2026-09-20T14:00:00+05:00","recurrence":"once"}]]
+- Ежедневное: [[REMINDER_CREATE: {"message":"текст","remind_at":"2026-09-20T09:00:00+05:00","recurrence":"daily"}]]
+- Напоминать периодически, пока не отметит выполненным (для важных задач): [[REMINDER_CREATE: {"message":"текст","remind_at":"2026-09-20T14:00:00+05:00","recurrence":"until_done","interval_minutes":60,"task_match":"ключевые слова задачи"}]] — используй, когда пользователь просит "напоминай, пока не сделаю" или похоже; interval_minutes — как часто дёргать (по умолчанию 60), task_match должен совпадать с текстом соответствующей задачи в его списке дел.
+Время в ISO формате с часовым поясом Узбекистана (+05:00), обязательно валидный JSON в одну строку. Посчитай точное время сам.
+
+Если пользователь просит остановить/отменить напоминание — напиши короткий ответ и добавь: [[REMINDER_STOP: {"match":"ключевые слова напоминания"}]]
+
+Если пользователь просит добавить задачу/дело в список (без привязки ко времени, просто "запомни что нужно сделать") — напиши короткий ответ и добавь: [[TASK_ADD: {"task":"текст задачи"}]]
+Если пользователь просит показать список задач/дел — напиши короткий ответ и добавь: [[TASK_LIST]]
+Если пользователь говорит, что задача выполнена/сделана — напиши короткий ответ и добавь: [[TASK_DONE: {"match":"ключевые слова из задачи"}]] — используй слова, по которым задачу можно узнать в списке.`;
 
 // ---------- память и история (Supabase) ----------
 async function getMemoryFacts() {
@@ -191,7 +209,8 @@ async function generateVoiceReply(text) {
 }
 
 function extractMarkers(text) {
-  let cleanText = text, imagePrompt = null, excelData = null;
+  let cleanText = text, imagePrompt = null, excelData = null, calendarList = false, calendarCreate = null, reminderCreate = null;
+  let taskAdd = null, taskList = false, taskDone = null;
   const imgMatch = text.match(/\[\[IMAGE_PROMPT:\s*([\s\S]*?)\]\]/);
   if (imgMatch) { imagePrompt = imgMatch[1].trim(); cleanText = cleanText.replace(imgMatch[0], "").trim(); }
   const excelMatch = text.match(/\[\[EXCEL_TABLE:\s*(\{[\s\S]*?\})\s*\]\]/);
@@ -199,10 +218,155 @@ function extractMarkers(text) {
     try { excelData = JSON.parse(excelMatch[1]); } catch (err) { console.error("EXCEL_TABLE parse error:", err); }
     cleanText = cleanText.replace(excelMatch[0], "").trim();
   }
-  return { cleanText, imagePrompt, excelData };
+  const listMatch = text.match(/\[\[CALENDAR_LIST\]\]/);
+  if (listMatch) { calendarList = true; cleanText = cleanText.replace(listMatch[0], "").trim(); }
+  const createMatch = text.match(/\[\[CALENDAR_CREATE:\s*(\{[\s\S]*?\})\s*\]\]/);
+  if (createMatch) {
+    try { calendarCreate = JSON.parse(createMatch[1]); } catch (err) { console.error("CALENDAR_CREATE parse error:", err); }
+    cleanText = cleanText.replace(createMatch[0], "").trim();
+  }
+  const reminderMatch = text.match(/\[\[REMINDER_CREATE:\s*(\{[\s\S]*?\})\s*\]\]/);
+  if (reminderMatch) {
+    try { reminderCreate = JSON.parse(reminderMatch[1]); } catch (err) { console.error("REMINDER_CREATE parse error:", err); }
+    cleanText = cleanText.replace(reminderMatch[0], "").trim();
+  }
+  let reminderStop = null;
+  const reminderStopMatch = text.match(/\[\[REMINDER_STOP:\s*(\{[\s\S]*?\})\s*\]\]/);
+  if (reminderStopMatch) {
+    try { reminderStop = JSON.parse(reminderStopMatch[1]); } catch (err) { console.error("REMINDER_STOP parse error:", err); }
+    cleanText = cleanText.replace(reminderStopMatch[0], "").trim();
+  }
+  const taskAddMatch = text.match(/\[\[TASK_ADD:\s*(\{[\s\S]*?\})\s*\]\]/);
+  if (taskAddMatch) {
+    try { taskAdd = JSON.parse(taskAddMatch[1]); } catch (err) { console.error("TASK_ADD parse error:", err); }
+    cleanText = cleanText.replace(taskAddMatch[0], "").trim();
+  }
+  const taskListMatch = text.match(/\[\[TASK_LIST\]\]/);
+  if (taskListMatch) { taskList = true; cleanText = cleanText.replace(taskListMatch[0], "").trim(); }
+  const taskDoneMatch = text.match(/\[\[TASK_DONE:\s*(\{[\s\S]*?\})\s*\]\]/);
+  if (taskDoneMatch) {
+    try { taskDone = JSON.parse(taskDoneMatch[1]); } catch (err) { console.error("TASK_DONE parse error:", err); }
+    cleanText = cleanText.replace(taskDoneMatch[0], "").trim();
+  }
+  return { cleanText, imagePrompt, excelData, calendarList, calendarCreate, reminderCreate, reminderStop, taskAdd, taskList, taskDone };
 }
 
-// ---------- разбор входящего сообщения в parts для Gemini ----------
+// ---------- задачи (to-do) ----------
+async function addTask(chatId, task) {
+  await fetch(`${SUPABASE_URL}/rest/v1/tasks`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify([{ chat_id: chatId, task }]),
+  });
+}
+
+async function listTasks(chatId) {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/tasks?chat_id=eq.${chatId}&done=eq.false&select=id,task&order=created_at.asc`,
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+  );
+  return res.ok ? await res.json() : [];
+}
+
+async function completeTask(chatId, matchText) {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/tasks?chat_id=eq.${chatId}&done=eq.false&task=ilike.*${encodeURIComponent(matchText)}*&select=id,task&limit=1`,
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+  );
+  const rows = res.ok ? await res.json() : [];
+  if (!rows.length) return null;
+  await fetch(`${SUPABASE_URL}/rest/v1/tasks?id=eq.${rows[0].id}`, {
+    method: "PATCH",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify({ done: true }),
+  });
+  return rows[0].task;
+}
+
+async function saveReminder(chatId, message, remindAt, recurrence, intervalMinutes, taskMatch) {
+  await fetch(`${SUPABASE_URL}/rest/v1/reminders`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify([{
+      chat_id: chatId, message, remind_at: remindAt,
+      recurrence: recurrence || "once",
+      interval_minutes: intervalMinutes || 60,
+      task_match: taskMatch || null,
+    }]),
+  });
+}
+
+async function stopReminder(chatId, matchText) {
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/reminders?chat_id=eq.${chatId}&sent=eq.false&message=ilike.*${encodeURIComponent(matchText)}*&select=id,message&limit=1`,
+    { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
+  );
+  const rows = res.ok ? await res.json() : [];
+  if (!rows.length) return null;
+  await fetch(`${SUPABASE_URL}/rest/v1/reminders?id=eq.${rows[0].id}`, {
+    method: "PATCH",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify({ sent: true }),
+  });
+  return rows[0].message;
+}
+
+
+async function getGoogleAccessToken() {
+  if (!SUPABASE_URL || !SUPABASE_KEY || !GOOGLE_CLIENT_ID) return null;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/google_tokens?select=refresh_token&order=created_at.desc&limit=1`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+    });
+    const rows = await res.json();
+    const refreshToken = rows?.[0]?.refresh_token;
+    if (!refreshToken) return null;
+
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    return tokenData.access_token || null;
+  } catch (err) { console.error("Ошибка получения Google-токена:", err); return null; }
+}
+
+async function listUpcomingEvents(accessToken, maxResults = 10) {
+  const now = new Date().toISOString();
+  const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(now)}&maxResults=${maxResults}&orderBy=startTime&singleEvents=true`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const data = await res.json();
+  if (!res.ok) throw new Error("Calendar API error: " + JSON.stringify(data).slice(0, 200));
+  return (data.items || []).map((e) => ({
+    title: e.summary || "(без названия)",
+    start: e.start?.dateTime || e.start?.date,
+    end: e.end?.dateTime || e.end?.date,
+  }));
+}
+
+async function createCalendarEvent(accessToken, { title, start, end, description }) {
+  const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      summary: title,
+      description: description || "",
+      start: { dateTime: start },
+      end: { dateTime: end },
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error("Calendar create error: " + JSON.stringify(data).slice(0, 200));
+  return data;
+}
+
+
 const URL_REGEX = /https?:\/\/[^\s]+/;
 
 async function messageToParts(message) {
@@ -286,9 +450,10 @@ export default async function handler(req, res) {
     const userTextForHistory = partsToUserText(userParts);
 
     const [knownFacts, history] = await Promise.all([getMemoryFacts(), getHistory(chatId)]);
-    const systemPrompt = knownFacts.length
+    const nowTashkent = new Date().toLocaleString("ru-RU", { timeZone: "Asia/Tashkent", dateStyle: "full", timeStyle: "short" });
+    const systemPrompt = (knownFacts.length
       ? BASE_SYSTEM_PROMPT + `\n\nВот что ты уже знаешь о Саидбонуре из прошлых разговоров:\n` + knownFacts.map((f) => "- " + f).join("\n")
-      : BASE_SYSTEM_PROMPT;
+      : BASE_SYSTEM_PROMPT) + `\n\nСейчас в Узбекистане: ${nowTashkent}.`;
 
     const contents = [
       ...history.map((h) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] })),
@@ -307,7 +472,7 @@ export default async function handler(req, res) {
     }
 
     const rawReply = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "Не смог сформулировать ответ.";
-    const { cleanText, imagePrompt, excelData } = extractMarkers(rawReply);
+    const { cleanText, imagePrompt, excelData, calendarList, calendarCreate, reminderCreate, reminderStop, taskAdd, taskList, taskDone } = extractMarkers(rawReply);
 
     if (cleanText) await sendTelegramMessage(chatId, cleanText);
 
@@ -328,6 +493,63 @@ export default async function handler(req, res) {
         const buffer = buildExcelBuffer(excelData);
         await sendTelegramDocument(chatId, buffer, (excelData.sheetName || "table") + ".xlsx");
       } catch (err) { await sendTelegramMessage(chatId, "Не смог собрать Excel-файл: " + err.message); }
+    }
+
+    if (calendarList || calendarCreate) {
+      const accessToken = await getGoogleAccessToken();
+      if (!accessToken) {
+        await sendTelegramMessage(chatId, "Календарь ещё не подключён — открой ссылку авторизации Google, которую тебе давали, чтобы дать доступ.");
+      } else if (calendarList) {
+        try {
+          const events = await listUpcomingEvents(accessToken);
+          const text = events.length
+            ? "📅 Ближайшие события:\n" + events.map((e) => `• ${e.title} — ${e.start}`).join("\n")
+            : "📅 В календаре пока ничего не запланировано.";
+          await sendTelegramMessage(chatId, text);
+        } catch (err) { await sendTelegramMessage(chatId, "Не смог получить календарь: " + err.message); }
+      } else if (calendarCreate) {
+        try {
+          await createCalendarEvent(accessToken, calendarCreate);
+          await sendTelegramMessage(chatId, `✅ Добавил в календарь: "${calendarCreate.title}"`);
+        } catch (err) { await sendTelegramMessage(chatId, "Не смог создать событие: " + err.message); }
+      }
+    }
+
+    if (taskAdd?.task) {
+      try {
+        await addTask(chatId, taskAdd.task);
+        await sendTelegramMessage(chatId, `✅ Добавил в задачи: "${taskAdd.task}"`);
+      } catch (err) { await sendTelegramMessage(chatId, "Не смог сохранить задачу: " + err.message); }
+    }
+
+    if (taskList) {
+      try {
+        const tasks = await listTasks(chatId);
+        const text = tasks.length
+          ? "📋 Твои задачи:\n" + tasks.map((t, i) => `${i + 1}. ${t.task}`).join("\n")
+          : "📋 Список задач пуст.";
+        await sendTelegramMessage(chatId, text);
+      } catch (err) { await sendTelegramMessage(chatId, "Не смог получить задачи: " + err.message); }
+    }
+
+    if (taskDone?.match) {
+      try {
+        const completed = await completeTask(chatId, taskDone.match);
+        await sendTelegramMessage(chatId, completed ? `✅ Отметил выполненной: "${completed}"` : "Не нашёл такую задачу в списке.");
+      } catch (err) { await sendTelegramMessage(chatId, "Не смог отметить задачу: " + err.message); }
+    }
+
+    if (reminderCreate?.message && reminderCreate?.remind_at) {
+      try {
+        await saveReminder(chatId, reminderCreate.message, reminderCreate.remind_at, reminderCreate.recurrence, reminderCreate.interval_minutes, reminderCreate.task_match);
+      } catch (err) { await sendTelegramMessage(chatId, "Не смог сохранить напоминание: " + err.message); }
+    }
+
+    if (reminderStop?.match) {
+      try {
+        const stopped = await stopReminder(chatId, reminderStop.match);
+        await sendTelegramMessage(chatId, stopped ? `🔕 Остановил напоминание: "${stopped}"` : "Не нашёл такое активное напоминание.");
+      } catch (err) { await sendTelegramMessage(chatId, "Не смог остановить напоминание: " + err.message); }
     }
 
     await Promise.all([
