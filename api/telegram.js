@@ -117,7 +117,6 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 export default async function handler(req, res) {
-  // Telegram ждёт быстрый ответ 200, всю работу можно делать после
   if (req.method !== "POST") {
     res.status(200).send("Telegram webhook is alive. Use POST.");
     return;
@@ -136,16 +135,15 @@ export default async function handler(req, res) {
     const userText = message.text;
 
     if (!userText) {
-      res.status(200).json({ ok: true });
       await sendTelegramMessage(chatId, "Пока умею только текст — фото, голос и файлы добавим следующим шагом 🙂");
+      res.status(200).json({ ok: true });
       return;
     }
-
-    res.status(200).json({ ok: true }); // отвечаем Telegram сразу, дальше работаем в фоне
 
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
     if (!GEMINI_API_KEY) {
       await sendTelegramMessage(chatId, "GEMINI_API_KEY не настроен на сервере.");
+      res.status(200).json({ ok: true });
       return;
     }
 
@@ -171,6 +169,7 @@ export default async function handler(req, res) {
     if (!geminiRes.ok) {
       console.error("Gemini error:", data);
       await sendTelegramMessage(chatId, "Ошибка от Gemini API: " + JSON.stringify(data).slice(0, 300));
+      res.status(200).json({ ok: true });
       return;
     }
 
@@ -184,6 +183,8 @@ export default async function handler(req, res) {
 
     const newFacts = await extractNewFacts(userText, reply, knownFacts, GEMINI_API_KEY);
     await saveMemoryFacts(newFacts);
+
+    res.status(200).json({ ok: true });
   } catch (err) {
     console.error(err);
     if (!res.headersSent) {
