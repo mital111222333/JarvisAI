@@ -298,7 +298,7 @@ export default async function handler(req, res) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
     const geminiRes = await fetch(url, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: systemPrompt }] }, tools: [{ google_search: {} }] }),
+      body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: systemPrompt }] } }),
     });
     const data = await geminiRes.json();
     if (!geminiRes.ok) {
