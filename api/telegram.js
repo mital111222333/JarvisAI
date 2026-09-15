@@ -556,8 +556,12 @@ export default async function handler(req, res) {
       saveHistory(chatId, "user", userTextForHistory),
       saveHistory(chatId, "assistant", cleanText || rawReply),
     ]);
-    const newFacts = await extractNewFacts(userTextForHistory, cleanText || rawReply, knownFacts, GEMINI_API_KEY);
-    await saveMemoryFacts(newFacts);
+
+    const wasCommand = imagePrompt || excelData || calendarList || calendarCreate || reminderCreate || reminderStop || taskAdd || taskList || taskDone;
+    if (!wasCommand) {
+      const newFacts = await extractNewFacts(userTextForHistory, cleanText || rawReply, knownFacts, GEMINI_API_KEY);
+      await saveMemoryFacts(newFacts);
+    }
 
     res.status(200).json({ ok: true });
   } catch (err) {
